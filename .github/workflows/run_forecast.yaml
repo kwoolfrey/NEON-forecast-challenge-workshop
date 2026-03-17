@@ -6,7 +6,7 @@ on:
 jobs:
   run_forecast:
     runs-on: ubuntu-latest
-      container:
+    container:
       image: eco4cast/rocker-neon4cast
     steps:
       - name: Checkout repo
@@ -15,6 +15,6 @@ jobs:
           fetch-depth: 0
               
 # Point to the right path, run the right Rscript command
-    - name: Run automatic forecast submission
+      - name: Run automatic forecast submission
       run: Rscript Submit_forecast/forecast_code_template_mod6.R
             
