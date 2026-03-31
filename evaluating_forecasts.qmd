@@ -1,0 +1,173 @@
+---
+title: "evaluating_forecasts"
+format: html
+editor: visual
+execute:
+  echo: false
+---
+
+## Part 1:
+```{r setup, include=FALSE} 
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+library(duckdbfs)
+library(tidyverse)
+library(duckdb)
+library(scoringRules)
+```
+
+```{r}
+# data sources
+
+all_results <- duckdbfs::open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature", 
+                                      s3_endpoint = "sdsc.osn.xsede.org", anonymous = TRUE)
+url <- "https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz"
+targets <- read_csv(url)
+
+# filtering target data 
+targets_single_forecast <- targets %>%
+  filter(site_id == "BARC",
+         (datetime >= as_datetime("2025-03-31 00:00:00") & datetime<=as_datetime("2025-05-03 00:00:00")),
+         variable == "temperature")
+
+# collecting model predictions
+my_forecast <- all_results %>% filter(
+  site_id == "BARC",
+  reference_datetime == as_datetime("2025-03-30 00:00:00"),
+  model_id %in% c("climatology", "persistenceRW", "zimmerman_proj1")) %>% 
+  collect()
+
+# reformatting forecasts so we can assess them 
+zimmerman <- my_forecast %>% filter(model_id == "zimmerman_proj1") %>%
+  group_by(datetime) %>%
+  summarize(mu = mean(prediction),
+            sigma = sd(prediction),
+            model_id = unique(model_id))
+persistence <- my_forecast %>% filter(model_id == "persistenceRW") %>%
+  group_by(datetime) %>%
+  summarize(mu = mean(prediction),
+            sigma = sd(prediction),
+            model_id = unique(model_id))
+climatology <- my_forecast %>% filter(model_id == "climatology",
+                                      datetime <= as_datetime("2025-05-03 00:00:00"))%>%
+  select(c(parameter, prediction, datetime, model_id)) %>%
+  pivot_wider(names_from = parameter, values_from = prediction)
+  
+# put em together
+final_forecasts <- rbind(persistence, zimmerman, climatology) 
+
+# assigned model_id as factor so we can plot it better
+final_forecasts$model_id <- factor(final_forecasts$model_id, levels = c("persistenceRW", "climatology", "zimmerman_proj1"))
+
+# plotting our big ugly plot 
+final_forecasts %>%
+mutate(lower_2.5 = mu-1.96*sigma,
+       upper_97.5 = mu+1.96*sigma) %>%
+  ggplot(aes(x=datetime))+geom_ribbon(aes(ymin=lower_2.5,
+                                          ymax = upper_97.5,
+                                      fill = model_id), alpha = 0.5)+
+  geom_line(aes(y=mu, color = model_id))+labs(x="Datetime", y="Prediction", title="Ribbon Plot of Water Temperature Forecasts")+
+  geom_point(data = targets_single_forecast, aes(x=datetime, y=observation, fill = "observation"))
+
+
+```
+
+Honestly, it's kinda hard to assess which forecast did better at matching the observations when they're all plotted on the same graph. But I think the climatology forecast slightly outperformed the other two. None of the forecasts were able to capture the jump in temperature at the beginning of April. While the persistence forecast had the most uncertainty, I wouldn't say that helped it in capturing the observations very well. It seems like it's high uncertainty didn't really pay off.
+
+```{r}
+# function for assessing our ensemble forecasts
+crps_tidy_ensemble <- function(prediction, observation) {
+  obs <- observation[1] #all the observations are the same for each row, but we only need one
+  crps_sample(obs, prediction)
+}
+
+# trying to get my climatology data in order
+multi_forecast_parametric <- my_forecast %>%
+  filter(model_id == "climatology") %>%
+  left_join(targets_single_forecast, by = c("datetime", "site_id", "variable")) %>% 
+  select(model_id, datetime, prediction, observation, parameter) %>%
+  pivot_wider(names_from = parameter, values_from = prediction)
+
+# could've done this in one pipe but that's ok 
+normal_crps <- multi_forecast_parametric %>%
+  group_by(datetime, model_id) %>%
+  summarize(crps = crps_norm(observation, mean = mu, sd = sigma))
+
+# trying to get my other two models in order
+multi_forecast_ensemble <- my_forecast %>%
+  filter(model_id %in% c("zimmerman_proj1", "persistenceRW")) %>%
+  left_join(targets, by = c("datetime", "site_id", "variable")) %>% 
+  select(model_id, datetime, prediction, observation, parameter)
+
+# yes
+ensemble_crps <- multi_forecast_ensemble %>%
+  group_by(datetime, model_id) %>%
+  summarize(crps = crps_tidy_ensemble(prediction, observation)) 
+
+# plotting all of it 
+ggplot(data = ensemble_crps, aes(x=datetime, y=crps, color = model_id))+geom_line()+
+  geom_line(data=normal_crps, aes(x=datetime, y=crps))+labs(x="Datetime", y="CRPS", title="CRPS of Three Water Temperature Models over Time")
+
+```
+
+This graph also isn't the prettiest and I'm sorry that the color schemes don't match. From this, it appears that climatology has the lowest CRPS throughout the study area, other than a period in mid-April where the Zimmerman forecast outperformed it. I would say the two performed quite similarly. It's clear in this plot that the persistence model performed the poorest.
+
+## Part 2:
+
+performing any kind of function on a dataset of 9 million observations sucks
+
+```{r}
+my_forecast <- all_results %>% filter(
+  site_id == "BARC",
+  model_id %in% c("climatology", "persistenceRW", "zimmerman_proj1")) %>% 
+  collect()
+
+# collecting all of the targets data since the beginning of the model runs 
+targets_multi <- targets %>%
+  filter(site_id == "BARC",
+         (datetime >= as_datetime("2021-05-01 00:00:00")),
+         variable == "temperature")
+
+# sorry i just love to waste storage actually
+climatology <- my_forecast %>%
+  filter(model_id == "climatology") 
+  
+# reformatting everything!!
+multi_forecast_parametric <- climatology %>% 
+  select(model_id, reference_datetime, datetime, prediction, parameter) %>%
+  pivot_wider(names_from = parameter, values_from = prediction) %>%
+  left_join(targets_multi, by = c( "datetime") ) %>%
+  unnest(c(mu, sigma))
+
+# calculating CRPS for every prediction
+normal_crps <- multi_forecast_parametric %>%
+  group_by(datetime, reference_datetime) %>%
+  summarize(crps = crps_norm(observation, mean = mu, sd = sigma))
+
+# final mean !
+print("climatology mean CRPS:")
+mean(normal_crps$crps, na.rm=TRUE)
+
+
+# let's reformat the ensemble data 
+multi_forecast_ensemble <- my_forecast %>%
+  filter(model_id %in% c("zimmerman_proj1", "persistenceRW")) %>%
+  left_join(targets, by = c("datetime", "site_id", "variable")) %>% 
+  select(model_id, datetime, reference_datetime, prediction, observation, parameter)
+
+ensemble_crps <- multi_forecast_ensemble %>%
+  filter(!is.na(observation))%>%
+  group_by(datetime, reference_datetime, model_id) %>%
+  summarize(crps = crps_tidy_ensemble(prediction, observation)) 
+
+PRW <- ensemble_crps %>% filter(model_id == "persistenceRW") 
+print("persistenceRW mean CRPS:")
+mean(PRW$crps, na.rm=TRUE)
+
+print("zimmerman_proj1 mean CRPS:")
+zimmer <- ensemble_crps %>% filter(model_id == "zimmerman_proj1")
+mean(zimmer$crps, na.rm=TRUE)
+```
+
+It looks like the climatology model has the lowest overall CRPS ! So not only did it outperform the other models in our smaller time frame in part 1, it also seems to do better overall.
+
+I think CRPS is a good way to assess models as it seemed intuitive to me. However, I understand that it has limitations and it probably doesn't give you the whole story. It would be interesting to use other skill scores for assessing these forecasts.
