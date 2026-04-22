@@ -182,7 +182,7 @@ for(i in 1:length(focal_sites)) {
             mean_temp = mean(prediction, na.rm=TRUE),
             sd_temp = sd(prediction, na.rm=TRUE))
       print(last_forecast$mean_temp)
-      forecasted_temperature <- param_df$beta1[ens] + param_df$beta2[ens] * temp_driv$air_temperature + param_df$beta3[ens] * temp_driv$avg_3day_rad + param_df$beta4[ens]*rnorm(1, mean = last_forecast$mean_temp, sd = last_forecast$sd_temp)+rnorm(n=1, mean = 0, sd = sigma)
+      forecasted_temperature <- param_df$beta1[ens] + param_df$beta2[ens] * temp_driv$air_temperature + param_df$beta3[ens] * temp_driv$avg_3day_rad + param_df$beta4[ens]*last_forecast$mean_temp+rnorm(n=1, mean = 0, sd = sigma)
       } else {
         forecasted_temperature <- param_df$beta1[ens] + param_df$beta2[ens] * temp_driv$air_temperature + param_df$beta3[ens] * temp_driv$avg_3day_rad + param_df$beta4[ens]+rnorm(n=1, mean = 0, sd = sigma)
       }
