@@ -1,0 +1,314 @@
+---
+title: "Preliminary Reforecast"
+format: 
+  html :
+    embed-resources: true
+editor: visual
+execute:
+  echo: false
+  warning: false
+---
+
+```{r}
+library(tidyverse)
+library(lubridate)
+library(zoo)
+library(duckdbfs)
+library(duckdb)
+library(scoringRules)
+```
+
+I chose to train my model using 7 years of data outside of my time frame. 2017-2023 were used for training; my reforecast takes place between August 29, 2024, and October 2, 2025. Those dates are kinda arbitrary. I know we discussed in class putting the training within the loops so the model is constantly updated with the latest data but I decided not to do that. It already takes this code quite a while to run and I don't think the relationship between air and water temperature is likely to change much over time. I may choose to implement more data assimilation in my project but for now, this seemed like an easy way to reduce some processing and development time.
+
+```{r}
+### pls pls pls don't let the data leak 
+met_variables <- c("air_temperature", "surface_downwelling_shortwave_flux_in_air")
+
+# Past stacked weather -----
+weather_past_s3 <- neon4cast::noaa_stage3()
+
+weather_past_pre <- weather_past_s3  |> 
+  dplyr::filter(site_id == "BARC",
+                (datetime >= ymd('2017-01-01')),
+                variable %in% met_variables) |> 
+  dplyr::collect()
+# i'm being paranoid 
+weather_past <- weather_past_pre %>% filter(datetime <= ymd("2024-01-01"))
+
+
+# aggregate the past to mean values
+weather_past_daily <- weather_past |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction)
+weather_past_daily <- weather_past_daily %>%
+  mutate(avg_3day_rad = rollmean(surface_downwelling_shortwave_flux_in_air, k = 5, align = "right", fill = NA))
+
+```
+
+```{r}
+# target and training model on old data
+n_members <- 31
+
+targets <- read_csv("https://sdsc.osn.xsede.org/bio230014-bucket01/challenges/targets/project_id=neon4cast/duration=P1D/aquatics-targets.csv.gz")
+
+# Filter the targets
+targets <- targets %>%
+  filter(site_id == "BARC",
+         variable == 'temperature')
+
+targets_lm <- targets |> 
+  pivot_wider(names_from = 'variable', values_from = 'observation') |>
+  mutate(lagged = lag(temperature, 1)) %>%
+  left_join(weather_past_daily, 
+            by = c("datetime","site_id"))
+
+fit <- lm(targets_lm$temperature ~ targets_lm$air_temperature + targets_lm$avg_3day_rad + targets_lm$lagged)
+  coeffs <- round(fit$coefficients, 2)
+  #coeffs
+  fit_summary <- summary(fit)
+  #sigma for process uncertainty
+  sigma <- sd(fit_summary$residuals, na.rm=TRUE)
+  
+  # parameters for parameter uncertainty 
+  params_se <- fit_summary$coefficients[,2]
+  param_df <- data.frame(beta1 = rnorm(n_members, coeffs[1], params_se[1]),
+                         beta2 = rnorm(n_members, coeffs[2], params_se[2]),
+                         beta3 = rnorm(n_members, coeffs[3], params_se[3]),
+                         beta4 = rnorm(n_members, coeffs[4], params_se[4]))
+```
+
+```{r}
+# doing the forecasting
+dates <- seq(1, 365, by=7) 
+forecast_df <- NULL
+
+for (d in dates) {
+  
+  #d=1
+  #print(d)
+  noaa_date <- Sys.Date()-days(600-d)
+  forecast_date <- Sys.Date() - days(600-(d+1))
+
+  weather_future_s3 <- neon4cast::noaa_stage2(start_date = as.character(noaa_date))
+  
+  weather_future <- weather_future_s3 |> 
+  dplyr::filter(datetime >= forecast_date,
+                site_id == "BARC",
+                variable %in% met_variables) |> 
+  collect()
+
+  # collecting driver data as means 
+  weather_future_daily <- weather_future |> 
+    mutate(datetime = as_date(datetime)) |> 
+   # mean daily forecasts at each site per ensemble
+   group_by(datetime, site_id, parameter, variable) |> 
+   summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+    
+   # convert air temperature to Celsius if it is included in the weather data
+   mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+   pivot_wider(names_from = variable, values_from = prediction) 
+  
+    pre_date <- forecast_date-35
+    weather_past_pre <- weather_past_s3  |> 
+   dplyr::filter(site_id == "BARC",
+                (datetime < ymd(forecast_date)),
+                datetime >= ymd(pre_date),
+                variable %in% met_variables) |> 
+  dplyr::collect()
+    
+    weather_past_daily <- weather_past_pre |> 
+  mutate(datetime = as_date(datetime)) |> 
+  group_by(datetime, site_id, variable) |> 
+  summarize(prediction = mean(prediction, na.rm = TRUE), .groups = "drop") |> 
+  # convert air temperature to Celsius if it is included in the weather data
+  mutate(prediction = ifelse(variable == "air_temperature", prediction - 273.15, prediction)) |> 
+  pivot_wider(names_from = variable, values_from = prediction)
+    
+  weather_past_daily$parameter <- NA
+  total_weather <- rbind(weather_past_daily, weather_future_daily)
+  
+  total_weather <- total_weather %>% group_by(datetime) %>%
+    mutate(avg_3day_rad = rollmean(surface_downwelling_shortwave_flux_in_air, k = 5, align = "right", 
+    fill = NA))
+  #i still don't think the rolling average is working correctly 
+  
+  forecasted_dates <- seq(from = ymd(forecast_date), to = ymd(forecast_date) + 35, by = "day")
+  for (t in 1:length(forecasted_dates)) {
+    #t=1
+    #print(forecasted_dates[t])
+  for (ens in 1:30) {
+    #ens = 0
+    temp_driv <- total_weather %>%
+    filter(datetime == forecasted_dates[t],
+    parameter == ens)
+    
+    if (t!=1){
+      last_forecast <- forecast_df %>%
+      filter(datetime == forecasted_dates[t-1])%>%
+      summarize(
+        mean_temp = mean(prediction, na.rm=TRUE),
+        sd_temp = sd(prediction, na.rm=TRUE))
+      #print(last_forecast$mean_temp)
+      #### change it back so it uses the last forecast!
+      
+      variables <- c(param_df$beta1[ens], param_df$beta2[ens] * temp_driv$air_temperature,
+                     param_df$beta3[ens] * temp_driv$avg_3day_rad,
+                     param_df$beta4[ens]*rnorm(1, mean = last_forecast$mean_temp, 
+                                               sd = last_forecast$sd_temp),
+                     rnorm(n=1, mean = 0, sd = sigma)
+                     )
+      forecasted_temperature<- sum(variables, na.rm=TRUE)
+      #forecasted_temperature <- param_df$beta1[ens] + param_df$beta2[ens] * temp_driv$air_temperature +
+      #  param_df$beta3[ens] * temp_driv$avg_3day_rad + 
+      #  param_df$beta4[ens]*rnorm(1, mean = last_forecast$mean_temp, sd = last_forecast$sd_temp)+
+      #  rnorm(n=1, mean = 0, sd = sigma)
+      } 
+    else {
+      real_data <- targets_lm %>% filter(
+        datetime == (forecasted_dates[t] - days(1))
+      )
+      variables <- c(param_df$beta1[ens], param_df$beta2[ens] * temp_driv$air_temperature,
+                     param_df$beta3[ens] * temp_driv$avg_3day_rad,
+                     param_df$beta4[ens] * real_data$temperature,
+                     rnorm(n=1, mean = 0, sd = sigma)
+                     )
+      forecasted_temperature<-sum(variables, na.rm=TRUE)
+      }
+      # put all the relevant information into a tibble that we can bind together
+    curr_site_df <- tibble(datetime = forecasted_dates[t],
+                           horizon = t, 
+                             site_id = "BARC",
+                             parameter = ens,
+                             prediction = forecasted_temperature,
+                             variable = "temperature") 
+    forecast_df <- dplyr::bind_rows(forecast_df, curr_site_df)
+  }
+    
+    
+  }
+}
+```
+
+```{r}
+forecast_df_EFI <- forecast_df %>%
+  mutate(model_id = "my_model_id",
+         reference_datetime = forecast_date,
+         family = 'ensemble',
+         duration = 'P1D',
+         parameter = as.character(parameter),
+         project_id = 'neon4cast')
+
+
+#forecast_df_EFI |> 
+#  ggplot(aes(x=datetime, y=prediction, group = parameter)) +
+#  geom_line() +
+#  facet_wrap(~site_id) +
+#  labs(title = paste0('Forecast generated for ', forecast_df_EFI$variable[1], #' on ', forecast_df_EFI$reference_datetime[1]))
+
+```
+
+```{r}
+## collecting the other forecasts for comparison
+all_results <- duckdbfs::open_dataset("s3://bio230014-bucket01/challenges/forecasts/bundled-parquet/project_id=neon4cast/duration=P1D/variable=temperature", s3_endpoint = "sdsc.osn.xsede.org", anonymous = TRUE)
+
+my_forecast <- all_results %>% filter(
+  site_id == "BARC",
+  datetime >= as_datetime("2024-08-31 00:00:00"),
+  datetime <= as_datetime("2025-10-04 00:00:00"),
+  model_id %in% c("climatology", "persistenceRW")) %>% 
+  collect()
+
+persistence <- my_forecast %>% filter(model_id == "persistenceRW") 
+#  group_by(datetime) %>%
+ # summarize(mu = mean(prediction),
+  #          sigma = sd(prediction),
+   #         model_id = unique(model_id))
+  persistence$horizon <- as.integer(persistence$datetime - persistence$reference_datetime)
+
+
+climatology <- my_forecast %>% filter(model_id == "climatology") %>%
+ # select(c(parameter, prediction, datetime, model_id)) %>%
+  pivot_wider(names_from = parameter, values_from = prediction)
+
+  climatology$horizon <- as.integer(climatology$datetime - climatology$reference_datetime)
+  #group_by(datetime) %>%
+  #summarize(mean_pred = mean(mu), 
+   #         sd_pred = sd(sigma))
+  
+targets_single_forecast <- targets %>%
+  filter(site_id == "BARC",
+         (datetime >= as_datetime("2024-08-29 00:00:00") & datetime<=as_datetime("2025-10-02 00:00:00")),
+         variable == "temperature")
+
+crps_tidy_ensemble <- function(prediction, observation) {
+ obs <- observation[1]
+  #all the observations are the same for each row, but we only need one
+  crps_sample(obs, prediction)
+}
+```
+
+```{r}
+knitr::opts_chunk$set(warning = FALSE, message = FALSE) 
+
+#multi_forecast_parametric <- climatology %>%
+#  left_join(targets_single_forecast, by = c("datetime"))
+  #select(model_id, datetime, prediction, observation, parameter) %>%
+#  pivot_wider(names_from = parameter, values_from = prediction)
+
+#normal_crps <- multi_forecast_parametric %>%
+#  group_by(datetime) %>%
+#  summarize(crps = crps_norm(observation, mean = mean_pred, sd = sd_pred))
+
+# had to change up some stuff so we can compare across horizons 
+multi_forecast_ensemble <- persistence %>%
+  left_join(targets, by = c("datetime", "site_id", "variable")) 
+ # select(model_id, datetime, prediction, observation, parameter)
+multi_forecast_ensemble_2 <- climatology %>%
+  left_join(targets, by = c("datetime", "site_id", "variable")) 
+
+ensemble_crps <- multi_forecast_ensemble %>%
+  group_by(datetime, reference_datetime, model_id) %>%
+  summarize(crps = crps_tidy_ensemble(prediction, observation)) 
+
+ensemble_crps$horizon <- as.integer(ensemble_crps$datetime - ensemble_crps$reference_datetime)
+
+crps <- ensemble_crps %>% group_by(model_id, horizon) %>%
+  summarize(mean_crps = mean(crps))
+
+multi <- multi_forecast_ensemble %>% mutate(
+  crps = crps_tidy_ensemble(multi_forecast_ensemble$prediction, multi_forecast_ensemble$observation))
+
+
+ensemble_crps_2 <- multi_forecast_ensemble_2 %>%
+  group_by(horizon, model_id) %>%
+  summarize(crps = crps_norm(observation, mean = mu, sd = sigma))%>%
+  group_by(horizon, model_id) %>%
+  summarize(mean_crps = mean(crps))
+
+
+my_crps <- forecast_df %>%
+  left_join(targets_single_forecast, by = c("datetime"))%>%
+  group_by(horizon) %>%
+  summarize(crps = crps_tidy_ensemble(prediction, observation))
+
+```
+
+```{r}
+ggplot(data = crps, aes(x=horizon, y=mean_crps, color = "Persistence"))+geom_line()+
+  geom_line(data=ensemble_crps_2, aes(x=horizon, y=mean_crps, color = "Climatology"))+labs(x="Horizon", y="CRPS", title="CRPS of Three Water Temperature Models across Horizons") + 
+  geom_line(data = my_crps, aes(x=horizon, y=crps, color = "My Model"))+
+   scale_colour_manual("", 
+                      breaks = c("Persistence", "Climatology", "Example Model"),values = c("red", "green", "blue")) 
+
+```
+
+\*\* For some reason my model ID isn't showing up in the legend. My model is shown above as the gray line.
+
+After a bit of struggle, this is my model compared to persistence and climatology. This model uses predicted air temperature, the average of the past 3 days of shortwave infrared radiation, and the previous day's water temperature to predict the water temperature of Lake Barco. In order to implement lagged water temperature, the first day's water temperature is taken from the real observation of the previous day (assuming that is available information). The next days then use the previous day's forecast as their initial condition. As you can see from the plot, my model does not outperform either climatology or persistence across horizons. I think it's because my model fit relies heavily on the lagged water temperature variable, causing a huge spike in CRPS from day 1 to day 2 (in regards to horizon). I'm not sure why it seems to vary considerably across further horizons, I don't think it really reflects the performance of the model. I would guess that the model is pretty bad overall and just happens to be less bad at random points. Hopefully my final project model performs a bit better... 
+
+
+Code can be found here: https://github.com/kwoolfrey/project_repo/blob/main/reforecast_1.qmd
